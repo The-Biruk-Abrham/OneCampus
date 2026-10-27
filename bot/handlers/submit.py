@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional
 from telegram import Update
 from telegram.ext import (
@@ -8,12 +9,13 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    TypeHandler,
     filters,
 )
 from telegram.constants import ParseMode
 
 from ..api_client import api_client
-from ..config import TELEGRAM_ADMIN_GROUP_ID
+from ..config import TELEGRAM_ADMIN_GROUP_ID, TELEGRAM_PUBLIC_CHANNEL_ID, is_owner
 from ..formatters import format_single_event, safe_escape
 from ..pagination import (
     build_submission_confirm_keyboard,
@@ -24,6 +26,8 @@ from ..pagination import (
 )
 
 logger = logging.getLogger(__name__)
+
+ADDIS_TZ = ZoneInfo("Africa/Addis_Ababa")
 
 # Conversation States
 (
@@ -133,12 +137,13 @@ def extract_raw_content(update: Update) -> Dict[str, Any]:
 
 def parse_event_datetime(dt_text: str) -> datetime:
     """
-    Parses DD/MM/YYYY HH:MM (or DD/MM/YY HH:MM) string into datetime object.
+    Parses DD/MM/YYYY HH:MM (or DD/MM/YY HH:MM) string into an Addis Ababa timezone-aware datetime.
     """
     cleaned = dt_text.strip()
     for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%y %H:%M"):
         try:
-            return datetime.strptime(cleaned, fmt)
+            naive_dt = datetime.strptime(cleaned, fmt)
+            return naive_dt.replace(tzinfo=ADDIS_TZ)
         except ValueError:
             continue
     raise ValueError(f"Invalid datetime format: '{dt_text}'. Expected DD/MM/YYYY HH:MM")
@@ -158,7 +163,24 @@ def _get_submission(context: ContextTypes.DEFAULT_TYPE, user_id: Any = None) -> 
     return context.user_data['submission']
 
 
-def render_preview_text(sub: Dict[str, Any]) -> str:
+import warnings
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", message=r".*per_message=False.*", category=PTBUserWarning)
+
+
+async def is_user_admin_or_owner(user_id: Any) -> bool:
+    """Check if the user is the bot owner or an active admin."""
+    if not user_id:
+        return False
+    if is_owner(user_id):
+        return True
+    try:
+        return await api_client.check_admin_status(int(user_id))
+    except Exception:
+        return False
+
+
+def render_preview_text(sub: Dict[str, Any], is_direct_publish: bool = False) -> str:
     """
     Renders full structured submission preview text.
     """
@@ -193,18 +215,63 @@ def render_preview_text(sub: Dict[str, Any]) -> str:
         cap_clean = caption[:140] + "..." if len(caption) > 140 else caption
         lines.append(f"📝 *Original Text:* _{safe_escape(cap_clean)}_")
 
-    lines.append("\n_Check the details above. Tap any button below to edit a field, or Confirm to submit:_")
+    if is_direct_publish or sub.get('is_direct_publish'):
+        lines.append("\n⚡ *This will be published immediately to the channel (you are an admin/owner).*")
+    else:
+        lines.append("\n_Check the details above. Tap any button below to edit a field, or Confirm to submit:_")
+
     return "\n".join(lines)
+
+
+async def get_user_verified_clubs(user_id: Any) -> list[Dict[str, Any]]:
+    """
+    Returns the list of clubs where this Telegram user_id is in verified_officers.
+    If the user is the bot owner, returns all registered clubs.
+    """
+    if not user_id:
+        return []
+    clubs = await api_client.get_clubs()
+    if is_owner(user_id):
+        return clubs
+    return [
+        c for c in clubs
+        if str(user_id) in [str(o) for o in (c.get('verified_officers') or [])]
+    ]
 
 
 async def start_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Entry point for /submit or initial submission trigger.
-    Explicitly initializes context.user_data['submission'].
+    Explicitly checks officer status and initializes context.user_data['submission'].
     """
-    user_id = update.effective_user.id if update.effective_user else "unknown"
+    user = update.effective_user
+    user_id = user.id if user else None
     context.user_data.clear()
-    context.user_data['submission'] = {}
+
+    try:
+        verified_clubs = await get_user_verified_clubs(user_id)
+        user_is_admin = await is_user_admin_or_owner(user_id)
+    except Exception as e:
+        logger.error("Error checking verified officer status for user %s: %s", user_id, e)
+        verified_clubs = []
+        user_is_admin = False
+
+    if not verified_clubs and not user_is_admin:
+        rejection_text = (
+            "⚠️ *Access Restricted*\n\n"
+            "Only registered club representatives can submit events to Addis Ababa Science and Technology University (AASTU) Events Hub.\n\n"
+            "If you are a club officer, please contact the admin team to register your Telegram account as a verified representative."
+        )
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(rejection_text, parse_mode=ParseMode.MARKDOWN)
+        elif update.message:
+            await update.message.reply_text(rejection_text, parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+
+    sub = _get_submission(context, user_id)
+    sub['verified_clubs'] = verified_clubs
+    sub['is_direct_publish'] = user_is_admin
 
     intro_text = (
         "📝 *Event Submission Wizard*\n\n"
@@ -225,10 +292,69 @@ async def start_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def handle_content_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Processes forwarded post or direct content received from user.
-    Guarantees context.user_data['submission'] is initialized even on direct entry.
+    Guarantees officer authorization check and context.user_data['submission'] initialization.
+    Safeguards against hijacking other active conversation flows (e.g. Officer Management or Admin Edit).
     """
-    user_id = update.effective_user.id if update.effective_user else "unknown"
-    sub = _get_submission(context, user_id)
+    # 1. State Scope Check: verify if the user is currently in another active conversation flow
+    if 'officer_manage' in context.user_data and isinstance(context.user_data['officer_manage'], dict):
+        manage_data = context.user_data['officer_manage']
+        action = manage_data.get('action')
+        if action == 'add':
+            from .officers import handle_owner_add_officer_input
+            if 'club_id' in manage_data:
+                await handle_owner_add_officer_input(update, context)
+            else:
+                if update.message:
+                    await update.message.reply_text("⚠️ Please select a club from the buttons above first, or send /cancel to exit.")
+            return ConversationHandler.END
+        elif action == 'remove':
+            from .officers import handle_owner_rm_officer_input
+            if 'club_id' in manage_data:
+                await handle_owner_rm_officer_input(update, context)
+            else:
+                if update.message:
+                    await update.message.reply_text("⚠️ Please select a club from the buttons above first, or send /cancel to exit.")
+            return ConversationHandler.END
+
+    if 'create_club' in context.user_data and isinstance(context.user_data['create_club'], dict):
+        from .officers import handle_owner_create_club_name_input
+        if 'name' not in context.user_data['create_club']:
+            await handle_owner_create_club_name_input(update, context)
+            return ConversationHandler.END
+
+    if 'admin_edit' in context.user_data and isinstance(context.user_data['admin_edit'], dict):
+        from .admin import handle_admin_edit_field_input
+        await handle_admin_edit_field_input(update, context)
+        return ConversationHandler.END
+
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    # Gate check if this was a direct forward or media message without prior /submit
+    sub_data = context.user_data.get('submission')
+    if not isinstance(sub_data, dict) or 'verified_clubs' not in sub_data:
+        try:
+            verified_clubs = await get_user_verified_clubs(user_id)
+        except Exception as e:
+            logger.error("Error checking officer status in handle_content_received: %s", e)
+            verified_clubs = []
+
+        if not verified_clubs:
+            rejection_text = (
+                "⚠️ *Access Restricted*\n\n"
+                "Only registered club representatives can submit events to ASTU Events Hub.\n\n"
+                "If you are a club officer, please contact the admin team to register your Telegram account as a verified representative."
+            )
+            if update.message:
+                await update.message.reply_text(rejection_text, parse_mode=ParseMode.MARKDOWN)
+            elif update.callback_query:
+                await update.callback_query.message.reply_text(rejection_text, parse_mode=ParseMode.MARKDOWN)
+            return ConversationHandler.END
+
+        sub = _get_submission(context, user_id)
+        sub['verified_clubs'] = verified_clubs
+    else:
+        sub = _get_submission(context, user_id)
 
     try:
         raw_content = extract_raw_content(update)
@@ -258,6 +384,7 @@ async def handle_content_received(update: Update, context: ContextTypes.DEFAULT_
 async def handle_title_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Saves event title and proceeds to Club selection.
+    Auto-fills club if officer represents 1 club; shows verified club picker if >1.
     """
     title = update.message.text.strip() if update.message and update.message.text else ""
     if not title:
@@ -276,11 +403,10 @@ async def handle_title_received(update: Update, context: ContextTypes.DEFAULT_TY
         return STATE_CONFIRM
 
     try:
-        clubs = await api_client.get_clubs()
-        verified_clubs = [
-            c for c in clubs
-            if str(user_id) in [str(o) for o in (c.get('verified_officers') or [])]
-        ]
+        verified_clubs = sub.get('verified_clubs')
+        if not verified_clubs:
+            verified_clubs = await get_user_verified_clubs(user_id)
+            sub['verified_clubs'] = verified_clubs
 
         if len(verified_clubs) == 1:
             club = verified_clubs[0]
@@ -300,11 +426,12 @@ async def handle_title_received(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             return STATE_CATEGORY
         else:
-            # Show club picker with ➕ Other button
-            keyboard = build_club_picker_keyboard(clubs)
+            # Show club picker with only their verified clubs (or custom option for owner)
+            include_other = is_owner(user_id)
+            keyboard = build_club_picker_keyboard(verified_clubs, include_other=include_other)
             await update.message.reply_text(
                 "🏛️ *Step 2 of 5: Host Club / Organization*\n"
-                "Select the host club or choose ➕ Other to enter a custom name:",
+                "Select which of your verified clubs this event is for:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
             )
@@ -631,16 +758,27 @@ async def handle_preview_actions(update: Update, context: ContextTypes.DEFAULT_T
     if data == "submit:edit:club":
         sub['editing_from_preview'] = True
         try:
-            clubs = await api_client.get_clubs()
-            keyboard = build_club_picker_keyboard(clubs)
+            verified_clubs = sub.get('verified_clubs') or await get_user_verified_clubs(user_id)
+            if len(verified_clubs) == 1:
+                # Single club officer: already set
+                sub['club'] = verified_clubs[0]['id']
+                sub['club_name'] = verified_clubs[0]['name']
+                sub['is_custom_club'] = False
+                preview_text = render_preview_text(sub)
+                keyboard = build_submission_confirm_keyboard()
+                await query.edit_message_text(preview_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                return STATE_CONFIRM
+
+            include_other = is_owner(user_id)
+            keyboard = build_club_picker_keyboard(verified_clubs, include_other=include_other)
             await query.edit_message_text(
-                "🏛️ *Edit Host Club*\nSelect the club from the list or choose ➕ Other:",
+                "🏛️ *Edit Host Club*\nSelect which of your verified clubs this event is for:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
             )
             return STATE_CLUB
         except Exception as e:
-            logger.error("Error loading clubs: %s", e)
+            logger.error("Error loading clubs for edit: %s", e)
             await query.edit_message_text("⚠️ Error loading clubs.")
             return STATE_CONFIRM
 
@@ -684,7 +822,9 @@ _notified_submission_event_ids: set = set()
 
 async def handle_submission_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    POSTs event to REST API with status=pending and notifies the Admin Group (exactly once with media).
+    POSTs event to REST API.
+    - If status is 'approved' (Admin/Owner direct publish): broadcasts immediately to public channel and sends one-line info log to Admin Group.
+    - If status is 'pending' (Club representative): posts approval card to Admin Group.
     """
     query = update.callback_query
     user_id = update.effective_user.id if update.effective_user else "unknown"
@@ -710,42 +850,87 @@ async def handle_submission_confirmation(update: Update, context: ContextTypes.D
     context.user_data.clear()
 
     try:
-        created_event = await api_client.create_event(payload)
+        submitter_id_int = int(user_id) if str(user_id).isdigit() else None
+        created_event = await api_client.create_event(payload, submitter_telegram_id=submitter_id_int)
         event_id = created_event['id']
 
-        success_text = (
-            "🎉 *Event Submitted Successfully!*\n\n"
-            f"Your event *{safe_escape(created_event.get('title'))}* has been submitted to the admin approval queue.\n"
-            "You will be notified once reviewed by the moderation team."
-        )
-        await query.edit_message_text(success_text, parse_mode=ParseMode.MARKDOWN)
+        if created_event.get('status') == 'approved':
+            # Direct Publish flow for Owner / Admins
+            from .admin import broadcast_event_to_channel
+            post_msg_id = await broadcast_event_to_channel(
+                bot=context.bot,
+                event=created_event,
+                channel_id=TELEGRAM_PUBLIC_CHANNEL_ID,
+            )
 
-        # Notify Admin Group exactly ONCE per event_id
-        if TELEGRAM_ADMIN_GROUP_ID:
-            global _notified_submission_event_ids
-            if event_id not in _notified_submission_event_ids:
-                _notified_submission_event_ids.add(event_id)
+            # Store channel_message_id if posted
+            if post_msg_id and submitter_id_int:
                 try:
-                    try:
-                        full_event = await api_client.get_event_detail(event_id)
-                    except Exception:
-                        full_event = created_event
+                    await api_client.update_event_status(
+                        event_id=event_id,
+                        status_value='approved',
+                        admin_telegram_id=submitter_id_int,
+                        channel_message_id=post_msg_id,
+                    )
+                except Exception as err:
+                    logger.error("Failed to store channel_message_id for direct publish event %d: %s", event_id, err)
 
-                    from .admin import send_admin_pending_notification
-                    await send_admin_pending_notification(
-                        bot=context.bot,
-                        event=full_event,
-                        admin_group_id=TELEGRAM_ADMIN_GROUP_ID,
+            # Send one-line info log to Admin Group (no approval buttons)
+            if TELEGRAM_ADMIN_GROUP_ID:
+                effective_name = update.effective_user.full_name or update.effective_user.username or "Admin"
+                if is_owner(user_id):
+                    effective_name = f"{effective_name} (Owner)"
+                admin_log_msg = f"📢 Event *{safe_escape(created_event.get('title'))}* posted directly by {safe_escape(effective_name)}."
+                try:
+                    await context.bot.send_message(
+                        chat_id=TELEGRAM_ADMIN_GROUP_ID,
+                        text=admin_log_msg,
+                        parse_mode=ParseMode.MARKDOWN,
                     )
-                except Exception as e:
-                    logger.error(
-                        "Failed to notify admin group %s: %s",
-                        TELEGRAM_ADMIN_GROUP_ID,
-                        e,
-                        exc_info=True,
-                    )
-            else:
-                logger.info("Admin notification for event %d already sent, skipping duplicate.", event_id)
+                except Exception as err:
+                    logger.error("Failed to post direct publish log to Admin Group: %s", err)
+
+            success_text = (
+                "⚡ *Event Published Directly!*\n\n"
+                f"Your event *{safe_escape(created_event.get('title'))}* has been published immediately to the public channel."
+            )
+            await query.edit_message_text(success_text, parse_mode=ParseMode.MARKDOWN)
+
+        else:
+            # Normal approval queue flow for Club Representatives
+            success_text = (
+                "🎉 *Event Submitted Successfully!*\n\n"
+                f"Your event *{safe_escape(created_event.get('title'))}* has been submitted to the admin approval queue.\n"
+                "You will be notified once reviewed by the moderation team."
+            )
+            await query.edit_message_text(success_text, parse_mode=ParseMode.MARKDOWN)
+
+            # Notify Admin Group exactly ONCE per event_id
+            if TELEGRAM_ADMIN_GROUP_ID:
+                global _notified_submission_event_ids
+                if event_id not in _notified_submission_event_ids:
+                    _notified_submission_event_ids.add(event_id)
+                    try:
+                        try:
+                            full_event = await api_client.get_event_detail(event_id)
+                        except Exception:
+                            full_event = created_event
+
+                        from .admin import send_admin_pending_notification
+                        await send_admin_pending_notification(
+                            bot=context.bot,
+                            event=full_event,
+                            admin_group_id=TELEGRAM_ADMIN_GROUP_ID,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to notify admin group %s: %s",
+                            TELEGRAM_ADMIN_GROUP_ID,
+                            e,
+                            exc_info=True,
+                        )
+                else:
+                    logger.info("Admin notification for event %d already sent, skipping duplicate.", event_id)
 
     except Exception as e:
         logger.error("Error submitting event: %s", e)
@@ -757,11 +942,49 @@ async def handle_submission_confirmation(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
+async def handle_submission_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handles submission conversation timeout (20 minutes of inactivity).
+    Cleans up user_data and returns user to the main menu.
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    context.user_data.clear()
+    msg = (
+        "⏱️ *Submission Session Timed Out*\n\n"
+        "Your event submission session expired due to inactivity.\n"
+        "You can tap *📝 Submit Post* or type `/submit` anytime to start again."
+    )
+    user_is_owner = is_owner(user_id)
+    user_is_officer = False
+    try:
+        verified_clubs = await get_user_verified_clubs(user_id)
+        user_is_officer = bool(verified_clubs) or user_is_owner
+    except Exception:
+        user_is_officer = user_is_owner
+
+    keyboard = build_start_keyboard(is_owner=user_is_owner, is_officer=user_is_officer)
+    if update.effective_message:
+        try:
+            await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        except Exception:
+            pass
+    return ConversationHandler.END
+
+
 async def cancel_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels the conversation cleanly and clears partial state."""
+    user_id = update.effective_user.id if update.effective_user else None
     context.user_data.clear()
     msg = "❌ Event submission cancelled. Returning to main menu."
-    keyboard = build_start_keyboard()
+    user_is_owner = is_owner(user_id)
+    user_is_officer = False
+    try:
+        verified_clubs = await get_user_verified_clubs(user_id)
+        user_is_officer = bool(verified_clubs) or user_is_owner
+    except Exception:
+        user_is_officer = user_is_owner
+
+    keyboard = build_start_keyboard(is_owner=user_is_owner, is_officer=user_is_officer)
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(msg, reply_markup=keyboard)
@@ -773,27 +996,14 @@ async def cancel_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 def get_submission_conversation_handler() -> ConversationHandler:
     """
     Builds the ConversationHandler for event submission.
-    Handles /submit command, inline start button, and directly forwarded media or text.
+    Requires explicit entry via /submit command or [📝 Submit Post] inline button.
+    Forwards and direct media are only processed after entering the submission session.
     Includes /cancel fallback, timeout (20 min), and single-field preview editing.
     """
     return ConversationHandler(
         entry_points=[
             CommandHandler("submit", start_submission),
             CallbackQueryHandler(start_submission, pattern="^btn:submit$"),
-            # Catch any forwarded message or direct media sent in private chat
-            MessageHandler(
-                filters.ChatType.PRIVATE & (
-                    filters.PHOTO
-                    | filters.VIDEO
-                    | filters.ANIMATION
-                    | filters.Document.ALL
-                    | filters.AUDIO
-                    | filters.VOICE
-                    | filters.POLL
-                    | filters.FORWARDED
-                ),
-                handle_content_received,
-            ),
         ],
         states={
             STATE_CONTENT: [
@@ -825,6 +1035,9 @@ def get_submission_conversation_handler() -> ConversationHandler:
             ],
             STATE_CONFIRM: [
                 CallbackQueryHandler(handle_preview_actions, pattern="^submit:")
+            ],
+            ConversationHandler.TIMEOUT: [
+                TypeHandler(Update, handle_submission_timeout),
             ],
         },
         fallbacks=[

@@ -1,6 +1,9 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Tuple
 from collections import defaultdict
+
+ADDIS_TZ = ZoneInfo("Africa/Addis_Ababa")
 
 CATEGORY_EMOJIS = {
     "academic": "🎓",
@@ -32,14 +35,19 @@ def get_category_emoji(category_name: str = "") -> str:
 
 
 def parse_datetime(dt_str: str) -> datetime:
-    """Parses ISO 8601 string into datetime object."""
+    """Parses ISO 8601 string into an Addis Ababa timezone-aware datetime object."""
     if not dt_str:
         return None
     try:
         # Handle trailing Z
         if dt_str.endswith('Z'):
             dt_str = dt_str[:-1] + '+00:00'
-        return datetime.fromisoformat(dt_str)
+        dt = datetime.fromisoformat(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ADDIS_TZ)
+        else:
+            dt = dt.astimezone(ADDIS_TZ)
+        return dt
     except Exception:
         return None
 
@@ -57,7 +65,7 @@ def format_time_range(start_dt: datetime, end_dt: datetime = None) -> str:
 
 def format_event_card(event: Dict[str, Any], index: int = None) -> str:
     """
-    Format a single event summary block for listing views.
+    Format a single event summary block for listing views in Addis Ababa local time.
     """
     start_dt = parse_datetime(event.get('start_datetime'))
     end_dt = parse_datetime(event.get('end_datetime'))
@@ -86,7 +94,7 @@ def format_event_card(event: Dict[str, Any], index: int = None) -> str:
 
 def format_single_event(event: Dict[str, Any]) -> str:
     """
-    Format detailed full view of an event.
+    Format detailed full view of an event in Addis Ababa local time.
     """
     start_dt = parse_datetime(event.get('start_datetime'))
     end_dt = parse_datetime(event.get('end_datetime'))
@@ -140,15 +148,15 @@ def format_today_events(
     page_size: int = 3,
 ) -> Tuple[str, int, int]:
     """
-    Formats today's events with pagination.
+    Formats today's events with pagination in Addis Ababa local time.
     Returns (formatted_text, total_pages, total_count).
     """
-    today_str = datetime.now().strftime("%A, %B %d, %Y")
+    today_str = datetime.now(ADDIS_TZ).strftime("%A, %B %d, %Y")
     total_count = len(events)
 
     if total_count == 0:
         return (
-            f"☀️ *Today at ASTU ({today_str})*\n\n"
+            f"☀️ *Today at AASTU ({today_str})*\n\n"
             "No events scheduled for today.\n"
             "Check out upcoming events with `/week` or browse by `/events`!",
             0,
@@ -162,7 +170,7 @@ def format_today_events(
     end_idx = start_idx + page_size
     page_events = events[start_idx:end_idx]
 
-    header = f"☀️ *Today at ASTU ({today_str})*\n"
+    header = f"☀️ *Today at AASTU ({today_str})*\n"
     header += f"_{total_count} event{'s' if total_count != 1 else ''} scheduled_\n"
     header += "─" * 28 + "\n\n"
 
@@ -178,16 +186,16 @@ def format_today_events(
 
 def format_week_events(events: List[Dict[str, Any]]) -> str:
     """
-    Formats events for the upcoming 7 days grouped by weekday.
+    Formats events for the upcoming 7 days grouped by weekday in Addis Ababa local time.
     """
     if not events:
         return (
-            "🗓️ *This Week at ASTU*\n\n"
+            "🗓️ *This Week at AASTU*\n\n"
             "No events scheduled for this week yet.\n"
             "Stay tuned for new club announcements!"
         )
 
-    # Group events by date string
+    # Group events by date string in Addis Ababa local time
     grouped = defaultdict(list)
     for event in events:
         start_dt = parse_datetime(event.get('start_datetime'))
@@ -198,7 +206,7 @@ def format_week_events(events: List[Dict[str, Any]]) -> str:
             grouped["Date TBD"].append(event)
 
     total_count = len(events)
-    header = f"🗓️ *This Week at ASTU ({total_count} Total)*\n"
+    header = f"🗓️ *This Week at AASTU ({total_count} Total)*\n"
     header += "─" * 28 + "\n"
 
     sections = []
@@ -268,29 +276,81 @@ def format_category_events(
     return (header + body + footer, total_pages, total_count)
 
 
-def format_channel_post(event: Dict[str, Any], max_len: int = 1024) -> str:
+def format_channel_post(event: Dict[str, Any], max_len: int = 100000) -> str:
     """
     Dedicated formatting function for Telegram Broadcast Channel posting.
-    Returns ONLY the original forwarded media caption/text completely untouched.
-    Structured fields are never rendered into or appended onto the public channel post.
+
+    1. Forwarded submissions (is_forwarded=True):
+       Returns the original forwarded media caption/text completely untouched without truncating.
+
+    2. Manual submissions (is_forwarded=False):
+       Composes a clear, fully formatted channel post FROM all structured fields:
+       Title, Club/Organizer, Category, Date/Time, Location/Venue, Recurrence (if any),
+       and whatever full description text the user typed without truncating.
     """
     raw_content = event.get('raw_content') or {}
+    is_forwarded = bool(raw_content.get('is_forwarded', False))
     caption = (raw_content.get('caption') or "").strip()
 
+    # Path 1: Forwarded Submissions -> preserve original content untouched
+    if is_forwarded:
+        if caption:
+            return caption
+        return event.get('title', 'Upcoming Event')
+
+    # Path 2: Manual Submissions -> compose complete formatted summary from structured fields
+    start_dt = parse_datetime(event.get('start_datetime'))
+    end_dt = parse_datetime(event.get('end_datetime'))
+    date_str = start_dt.strftime("%A, %B %d, %Y") if start_dt else "TBD"
+    time_str = format_time_range(start_dt, end_dt)
+
+    category_name = event.get('category_name') or 'General'
+    emoji = get_category_emoji(category_name)
+    title = safe_escape(event.get('title', 'Untitled Event'))
+    club = safe_escape(event.get('club_name') or 'University Club')
+    location = safe_escape(event.get('location') or 'Campus')
+    category_escaped = safe_escape(category_name)
+
+    is_custom_club = event.get('is_custom_club') or (not event.get('club') and event.get('custom_club'))
+    is_custom_cat = event.get('is_custom_category') or (not event.get('category') and event.get('custom_category'))
+
+    club_line = f"🏛️ *Organizer:* {club}"
+    if is_custom_club:
+        club_line = f"🏛️ *Organizer:* {club} _(Custom)_"
+
+    cat_line = f"{emoji} *Category:* {category_escaped}"
+    if is_custom_cat:
+        cat_line = f"{emoji} *Category:* {category_escaped} _(Custom)_"
+
+    lines = [
+        f"📢 *NEW CAMPUS EVENT*",
+        "─" * 28,
+        f"✨ *{title}* ✨",
+        club_line,
+        cat_line,
+        f"📅 *Date:* {date_str}",
+        f"⏰ *Time:* {time_str}",
+        f"📍 *Location:* {location}",
+    ]
+
+    if event.get('recurring') and event.get('recurrence_pattern'):
+        lines.append(f"🔄 *Recurrence:* {safe_escape(event['recurrence_pattern'])}")
+
+    base_post = "\n".join(lines)
+
     if caption:
-        if len(caption) > max_len:
-            return caption[:max_len - 3] + "..."
-        return caption
+        caption_esc = safe_escape(caption)
+        desc_block = f"\n\n📝 *Description:*\n{caption_esc}"
+        return base_post + desc_block
 
-    # Fallback to title only if no caption was provided
-    return event.get('title', 'Upcoming Event')
+    return base_post
 
 
-def format_admin_pending_card(event: Dict[str, Any], max_len: int = 1020) -> str:
+def format_admin_pending_card(event: Dict[str, Any], max_len: int = 1000) -> str:
     """
     Formats the structured review card specifically for the Admin Group notification.
     Includes Header, Structured Fields (Title, Organizer, Category, Date/Time, Location),
-    and original caption snippet, guaranteed to fit within Telegram media caption limit (max_len).
+    and original caption snippet if it fits within the media caption limit.
     """
     start_dt = parse_datetime(event.get('start_datetime'))
     end_dt = parse_datetime(event.get('end_datetime'))
@@ -343,3 +403,4 @@ def format_admin_pending_card(event: Dict[str, Any], max_len: int = 1020) -> str
             return f"{structured_text}\n\n📝 *Original Announcement:*\n_{caption_esc}_"
 
     return structured_text
+

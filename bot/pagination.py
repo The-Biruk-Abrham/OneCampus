@@ -118,9 +118,12 @@ def build_single_action_keyboard(
     return InlineKeyboardMarkup([row]) if row else None
 
 
-def build_start_keyboard() -> InlineKeyboardMarkup:
+def build_start_keyboard(is_owner: bool = False, is_officer: bool = False) -> InlineKeyboardMarkup:
     """
     Quick action menu buttons for /start.
+    - Public students see event browsing buttons.
+    - Verified club representatives see the [📝 Submit Post] button.
+    - Bot owner sees representative and club management buttons.
     """
     keyboard = [
         [
@@ -130,11 +133,48 @@ def build_start_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🏷️ Browse by Category", callback_data="btn:categories"),
         ],
+    ]
+
+    if is_owner or is_officer:
+        keyboard.append([
+            InlineKeyboardButton("📝 Submit Post", callback_data="btn:submit"),
+        ])
+
+    if is_owner:
+        keyboard.append([
+            InlineKeyboardButton("➕ Add Club Admin", callback_data="owner:add_admin"),
+            InlineKeyboardButton("➖ Remove Club Admin", callback_data="owner:remove_admin"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🏛️ Register New Club", callback_data="owner:create_club"),
+        ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_club_genre_keyboard() -> InlineKeyboardMarkup:
+    """
+    Keyboard for selecting club genre/type during club registration.
+    """
+    keyboard = [
         [
-            InlineKeyboardButton("➕ Submit New Event", callback_data="btn:submit"),
-        ]
+            InlineKeyboardButton("💻 Technology", callback_data="owner:genre:Technology"),
+            InlineKeyboardButton("🎓 Academic", callback_data="owner:genre:Academic"),
+        ],
+        [
+            InlineKeyboardButton("⚽ Sports", callback_data="owner:genre:Sports"),
+            InlineKeyboardButton("🎭 Arts & Culture", callback_data="owner:genre:Arts & Culture"),
+        ],
+        [
+            InlineKeyboardButton("🤝 Social & Community", callback_data="owner:genre:Social & Community"),
+            InlineKeyboardButton("📌 General", callback_data="owner:genre:General"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="owner:cancel"),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
+
 
 
 def build_submission_confirm_keyboard() -> InlineKeyboardMarkup:
@@ -162,9 +202,13 @@ def build_submission_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_club_picker_keyboard(clubs: List[Dict[str, Any]], callback_prefix: str = "submit:club") -> InlineKeyboardMarkup:
+def build_club_picker_keyboard(
+    clubs: List[Dict[str, Any]],
+    callback_prefix: str = "submit:club",
+    include_other: bool = True,
+) -> InlineKeyboardMarkup:
     """
-    Keyboard for selecting host club during submission, including an '➕ Other' option.
+    Keyboard for selecting host club during submission.
     """
     keyboard = []
     for club in clubs:
@@ -173,14 +217,56 @@ def build_club_picker_keyboard(clubs: List[Dict[str, Any]], callback_prefix: str
         keyboard.append([
             InlineKeyboardButton(f"🏛️ {cname}", callback_data=f"{callback_prefix}:{cid}")
         ])
-    # Option for Custom / Unlisted Club
-    keyboard.append([
-        InlineKeyboardButton("➕ Other (Type Custom Club)", callback_data=f"{callback_prefix}:other")
-    ])
+    if include_other:
+        # Option for Custom / Unlisted Club
+        keyboard.append([
+            InlineKeyboardButton("➕ Other (Type Custom Club)", callback_data=f"{callback_prefix}:other")
+        ])
     keyboard.append([
         InlineKeyboardButton("❌ Cancel Submission", callback_data="submit:cancel")
     ])
     return InlineKeyboardMarkup(keyboard)
+
+
+def build_owner_club_picker_keyboard(
+    clubs: List[Dict[str, Any]],
+    action: str = "add",
+) -> InlineKeyboardMarkup:
+    """
+    Keyboard for owner to select which club to add or remove representatives for.
+    """
+    keyboard = []
+    prefix = f"owner:club_{action}"
+    for club in clubs:
+        cid = club.get('id')
+        cname = club.get('name', 'Club')
+        officers_cnt = len(club.get('verified_officers', []))
+        keyboard.append([
+            InlineKeyboardButton(f"🏛️ {cname} ({officers_cnt} reps)", callback_data=f"{prefix}:{cid}")
+        ])
+    keyboard.append([
+        InlineKeyboardButton("❌ Cancel", callback_data="owner:cancel")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_owner_officers_list_keyboard(
+    club_id: int,
+    officers: List[Any],
+) -> InlineKeyboardMarkup:
+    """
+    Keyboard showing verified officers for a club with one-tap removal buttons.
+    """
+    keyboard = []
+    for off in officers:
+        keyboard.append([
+            InlineKeyboardButton(f"🗑️ Remove ID: {off}", callback_data=f"owner:rm_officer:{club_id}:{off}")
+        ])
+    keyboard.append([
+        InlineKeyboardButton("❌ Cancel", callback_data="owner:cancel")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
 
 
 def build_submission_category_keyboard(categories: List[Dict[str, Any]], callback_prefix: str = "submit:cat") -> InlineKeyboardMarkup:

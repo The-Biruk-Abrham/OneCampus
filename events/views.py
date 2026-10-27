@@ -48,10 +48,10 @@ class EventListCreateView(generics.ListCreateAPIView):
             if not admin:
                 queryset = queryset.filter(status=EventStatus.APPROVED)
 
-        # Filter by date range (today, week)
+        # Filter by date range (today, week) in local Addis Ababa timezone
         range_param = params.get('range', '').lower()
-        now = timezone.now()
-        start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_now = timezone.localtime(timezone.now())
+        start_of_today = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_today = start_of_today + timedelta(days=1)
 
         if range_param == 'today':
@@ -65,6 +65,7 @@ class EventListCreateView(generics.ListCreateAPIView):
                 start_datetime__gte=start_of_today,
                 start_datetime__lt=end_of_week,
             )
+
 
         # Filter by category (by ID or exact/icontains name)
         category_param = params.get('category')
@@ -139,14 +140,22 @@ class EventStatusUpdateView(views.APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-class ClubListView(generics.ListAPIView):
+class ClubListView(generics.ListCreateAPIView):
     """
     GET /api/clubs/
     - List all registered clubs and organizations.
+
+    POST /api/clubs/
+    - Admin/Owner endpoint to register a new club.
     """
     queryset = Club.objects.all().order_by('name')
     serializer_class = ClubSerializer
-    permission_classes = [AllowAny]
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [IsTelegramAdminUser()]
+        return [AllowAny()]
+
 
 
 class ClubDetailView(generics.RetrieveAPIView):
@@ -209,6 +218,24 @@ class ClubOfficersView(views.APIView):
         club.save(update_fields=['verified_officers', 'updated_at'])
 
         return Response(ClubSerializer(club).data, status=status.HTTP_200_OK)
+
+
+class AdminCheckView(views.APIView):
+    """
+    GET /api/admin-check/
+    - Checks if the user supplied via X-Telegram-User-Id header is an active admin or owner.
+    """
+    def get(self, request):
+        admin = get_telegram_admin_from_request(request)
+        if admin:
+            return Response({
+                "is_admin": True,
+                "name": admin.name,
+                "permission_level": admin.permission_level,
+            }, status=status.HTTP_200_OK)
+        return Response({
+            "is_admin": False,
+        }, status=status.HTTP_403_FORBIDDEN)
 
 
 class CategoryListView(generics.ListAPIView):

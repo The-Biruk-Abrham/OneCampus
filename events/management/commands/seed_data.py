@@ -48,22 +48,22 @@ class Command(BaseCommand):
         # 2. Seed Clubs
         clubs_data = [
             {
-                "name": "ASTU Software Development Club",
+                "name": "AASTU Software Development Club",
                 "category_type": "Technology",
                 "verified_officers": [111222333, 444555666],
-                "contact_info": "contact@astucoding.org | TG: @astu_devs",
+                "contact_info": "contact@aastucoding.org | TG: @aastu_devs",
             },
             {
-                "name": "ASTU Robotics & AI Society",
+                "name": "AASTU Robotics & AI Society",
                 "category_type": "Engineering",
                 "verified_officers": [777888999],
-                "contact_info": "robotics@astu.edu.et | TG: @astu_robotics",
+                "contact_info": "robotics@aastu.edu.et | TG: @aastu_robotics",
             },
             {
-                "name": "ASTU Athletics & Sports Guild",
+                "name": "AASTU Athletics & Sports Guild",
                 "category_type": "Sports & Athletics",
                 "verified_officers": [123456789, 987654321],
-                "contact_info": "sports@astu.edu.et | TG: @astu_sports",
+                "contact_info": "sports@aastu.edu.et | TG: @aastu_sports",
             },
         ]
 
@@ -115,8 +115,8 @@ class Command(BaseCommand):
         # 4. Seed Events across statuses (pending, approved, rejected, cancelled)
         sample_events = [
             {
-                "title": "Annual ASTU Hackathon 2026 Opening Ceremony",
-                "club": clubs["ASTU Software Development Club"],
+                "title": "Annual AASTU Hackathon 2026 Opening Ceremony",
+                "club": clubs["AASTU Software Development Club"],
                 "category": categories["Career/Workshop"],
                 "start_datetime": now + timedelta(hours=3),
                 "end_datetime": now + timedelta(hours=8),
@@ -129,12 +129,12 @@ class Command(BaseCommand):
                 "raw_content": {
                     "media_type": "photo",
                     "file_ids": ["AgACAgIAAxkBAAICamX1234samplephoto"],
-                    "caption": "🚀 Get ready for ASTU Hackathon 2026! 24 hours of non-stop coding, mentorship, and epic prizes. Doors open at 2 PM sharp!",
+                    "caption": "🚀 Get ready for AASTU Hackathon 2026! 24 hours of non-stop coding, mentorship, and epic prizes. Doors open at 2 PM sharp!",
                 },
             },
             {
                 "title": "Autonomous Drone Demo & Hands-on ROS2 Workshop",
-                "club": clubs["ASTU Robotics & AI Society"],
+                "club": clubs["AASTU Robotics & AI Society"],
                 "category": categories["Career/Workshop"],
                 "start_datetime": now + timedelta(days=2, hours=4),
                 "end_datetime": now + timedelta(days=2, hours=7),
@@ -152,11 +152,11 @@ class Command(BaseCommand):
             },
             {
                 "title": "Inter-Department Football Tournament Finals",
-                "club": clubs["ASTU Athletics & Sports Guild"],
+                "club": clubs["AASTU Athletics & Sports Guild"],
                 "category": categories["Sports"],
                 "start_datetime": now + timedelta(days=4, hours=2),
                 "end_datetime": now + timedelta(days=4, hours=5),
-                "location": "ASTU Stadium",
+                "location": "AASTU Stadium",
                 "status": EventStatus.PENDING,
                 "channel_message_id": None,
                 "approved_by": None,
@@ -170,7 +170,7 @@ class Command(BaseCommand):
             },
             {
                 "title": "Web3 & Distributed Systems Guest Lecture",
-                "club": clubs["ASTU Software Development Club"],
+                "club": clubs["AASTU Software Development Club"],
                 "category": categories["Academic"],
                 "start_datetime": now + timedelta(days=5, hours=1),
                 "end_datetime": now + timedelta(days=5, hours=3),
@@ -188,7 +188,7 @@ class Command(BaseCommand):
             },
             {
                 "title": "Unofficial Weekend Camping Trip",
-                "club": clubs["ASTU Software Development Club"],
+                "club": clubs["AASTU Software Development Club"],
                 "category": categories["Club Social"],
                 "start_datetime": now + timedelta(days=8),
                 "end_datetime": now + timedelta(days=9),
@@ -206,7 +206,7 @@ class Command(BaseCommand):
             },
             {
                 "title": "Intramural Basketball League Match #4",
-                "club": clubs["ASTU Athletics & Sports Guild"],
+                "club": clubs["AASTU Athletics & Sports Guild"],
                 "category": categories["Sports"],
                 "start_datetime": now + timedelta(days=1, hours=6),
                 "end_datetime": now + timedelta(days=1, hours=8),

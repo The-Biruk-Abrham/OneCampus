@@ -20,6 +20,10 @@ from ..pagination import (
     build_submission_category_keyboard,
 )
 
+import warnings
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", message=r".*per_message=False.*", category=PTBUserWarning)
+
 logger = logging.getLogger(__name__)
 
 # Admin Edit States
@@ -110,51 +114,114 @@ async def broadcast_event_to_channel(
     """
     Broadcasts the approved event to the public channel (with media if present)
     and returns the channel message_id.
-    Displays ONLY the original forwarded media and caption, completely untouched.
+    Handles caption length limits (1024 for media, 4096 for text) without truncation:
+    If caption > 1024 chars on media, sends media with title header and full text as a follow-up reply message.
     """
     raw_content = event.get('raw_content') or {}
-    caption_text = format_channel_post(event)
     media_type = raw_content.get('media_type', 'text')
     file_ids = raw_content.get('file_ids', [])
+    is_media = media_type in ('photo', 'video', 'document', 'animation') and bool(file_ids)
 
-    async def _try_send():
-        if media_type == 'photo' and file_ids:
-            msg = await bot.send_photo(
+    caption_text = format_channel_post(event)
+
+    async def _send_media_or_text(use_markdown: bool = True):
+        pm = ParseMode.MARKDOWN if use_markdown else None
+        text_to_send = (
+            caption_text
+            if use_markdown
+            else caption_text.replace('*', '').replace('_', '').replace('`', '').replace('\\', '')
+        )
+
+        if is_media:
+            # Check 1024 character caption limit
+            if len(text_to_send) <= 1024:
+                media_caption = text_to_send
+                follow_up_text = None
+            else:
+                title = event.get('title', 'Upcoming Event')
+                media_caption = f"📢 *{safe_escape(title)}*" if use_markdown else f"📢 {title}"
+                follow_up_text = text_to_send
+
+            media_msg = None
+            if media_type == 'photo' and file_ids:
+                media_msg = await bot.send_photo(
+                    chat_id=channel_id,
+                    photo=file_ids[0],
+                    caption=media_caption,
+                    parse_mode=pm,
+                )
+            elif media_type == 'video' and file_ids:
+                media_msg = await bot.send_video(
+                    chat_id=channel_id,
+                    video=file_ids[0],
+                    caption=media_caption,
+                    parse_mode=pm,
+                )
+            elif media_type == 'document' and file_ids:
+                media_msg = await bot.send_document(
+                    chat_id=channel_id,
+                    document=file_ids[0],
+                    caption=media_caption,
+                    parse_mode=pm,
+                )
+            elif media_type == 'animation' and file_ids:
+                media_msg = await bot.send_animation(
+                    chat_id=channel_id,
+                    animation=file_ids[0],
+                    caption=media_caption,
+                    parse_mode=pm,
+                )
+
+            if media_msg:
+                # If caption exceeded 1024, send follow-up reply message
+                if follow_up_text:
+                    try:
+                        extra_msg = await bot.send_message(
+                            chat_id=channel_id,
+                            text=follow_up_text,
+                            reply_to_message_id=media_msg.message_id,
+                            parse_mode=pm,
+                        )
+                        raw_content['channel_extra_message_id'] = extra_msg.message_id
+                    except Exception as extra_err:
+                        logger.warning("Failed to send follow-up channel message: %s", extra_err)
+                return media_msg.message_id
+
+        # Text-only message
+        if len(text_to_send) <= 4096:
+            msg = await bot.send_message(
                 chat_id=channel_id,
-                photo=file_ids[0],
-                caption=caption_text,
-            )
-            return msg.message_id
-        elif media_type == 'video' and file_ids:
-            msg = await bot.send_video(
-                chat_id=channel_id,
-                video=file_ids[0],
-                caption=caption_text,
-            )
-            return msg.message_id
-        elif media_type == 'document' and file_ids:
-            msg = await bot.send_document(
-                chat_id=channel_id,
-                document=file_ids[0],
-                caption=caption_text,
-            )
-            return msg.message_id
-        elif media_type == 'animation' and file_ids:
-            msg = await bot.send_animation(
-                chat_id=channel_id,
-                animation=file_ids[0],
-                caption=caption_text,
+                text=text_to_send,
+                parse_mode=pm,
             )
             return msg.message_id
         else:
+            # Split into 4096 chunks
+            first_chunk = text_to_send[:4096]
+            remainder = text_to_send[4096:]
             msg = await bot.send_message(
                 chat_id=channel_id,
-                text=caption_text,
+                text=first_chunk,
+                parse_mode=pm,
             )
+            try:
+                extra_msg = await bot.send_message(
+                    chat_id=channel_id,
+                    text=remainder[:4096],
+                    reply_to_message_id=msg.message_id,
+                    parse_mode=pm,
+                )
+                raw_content['channel_extra_message_id'] = extra_msg.message_id
+            except Exception:
+                pass
             return msg.message_id
 
     try:
-        return await _try_send()
+        try:
+            return await _send_media_or_text(use_markdown=True)
+        except Exception as md_err:
+            logger.warning("Markdown broadcast to channel %s failed (%s). Retrying as plaintext.", channel_id, md_err)
+            return await _send_media_or_text(use_markdown=False)
     except Exception as e:
         logger.error(
             "Error broadcasting to channel %s: %s. Please check if the bot is added as an Administrator to the channel.",
@@ -172,8 +239,8 @@ async def send_admin_pending_notification(
 ) -> Optional[int]:
     """
     Sends the pending event notification to the Admin Group.
-    Includes the photo/video/media and displays structured review details as the caption
-    with interactive Approve/Reject/Edit inline buttons.
+    Includes media and displays structured review card as caption.
+    If original caption is long, keeps structured card in caption and sends full text in reply.
     """
     from ..formatters import format_admin_pending_card
     raw_content = event.get('raw_content') or {}
@@ -187,6 +254,8 @@ async def send_admin_pending_notification(
     async def _try_send(use_markdown: bool = True):
         pm = ParseMode.MARKDOWN if use_markdown else None
         caption_text = formatted_caption if use_markdown else formatted_caption.replace('*', '').replace('_', '').replace('`', '')
+        if len(caption_text) > 1024:
+            caption_text = caption_text[:1020]
 
         if media_type == 'photo' and file_ids:
             msg = await bot.send_photo(
@@ -257,30 +326,55 @@ async def update_channel_message_in_place(
 ) -> bool:
     """
     Edits an existing Telegram channel broadcast post in place after event updates.
+    Handles long captions by editing both the media header and extra reply message.
     """
     formatted_caption = format_channel_post(event)
     raw_content = event.get('raw_content') or {}
     media_type = raw_content.get('media_type', 'text')
+    is_media = media_type in ('photo', 'video', 'document', 'animation')
 
     try:
-        if media_type in ('photo', 'video', 'document', 'animation'):
-            await bot.edit_message_caption(
-                chat_id=channel_id,
-                message_id=message_id,
-                caption=formatted_caption,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        if is_media:
+            if len(formatted_caption) <= 1024:
+                await bot.edit_message_caption(
+                    chat_id=channel_id,
+                    message_id=message_id,
+                    caption=formatted_caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                title = event.get('title', 'Upcoming Event')
+                short_caption = f"📢 *{safe_escape(title)}*"
+                await bot.edit_message_caption(
+                    chat_id=channel_id,
+                    message_id=message_id,
+                    caption=short_caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                extra_id = raw_content.get('channel_extra_message_id')
+                if extra_id:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=channel_id,
+                            message_id=extra_id,
+                            text=formatted_caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                    except Exception:
+                        pass
         else:
+            text_to_edit = formatted_caption[:4096]
             await bot.edit_message_text(
                 chat_id=channel_id,
                 message_id=message_id,
-                text=formatted_caption,
+                text=text_to_edit,
                 parse_mode=ParseMode.MARKDOWN,
             )
         return True
     except Exception as e:
         logger.error("Error editing channel message %d in place: %s", message_id, e)
         return False
+
 
 
 async def safe_edit_query_message(

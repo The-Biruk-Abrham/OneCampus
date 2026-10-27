@@ -4,7 +4,16 @@ Usage:
     python run_bot.py
 """
 import sys
+import io
 import socket
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except (AttributeError, io.UnsupportedOperation):
+        pass
+
 from bot.main import main
 
 _lock_socket = None

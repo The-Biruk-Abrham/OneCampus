@@ -7,6 +7,7 @@ from .views import (
     ClubDetailView,
     ClubOfficersView,
     CategoryListView,
+    AdminCheckView,
 )
 
 urlpatterns = [
@@ -22,4 +23,7 @@ urlpatterns = [
 
     # Categories
     path('categories/', CategoryListView.as_view(), name='category-list'),
+
+    # Admin verification
+    path('admin-check/', AdminCheckView.as_view(), name='admin-check'),
 ]

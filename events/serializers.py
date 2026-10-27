@@ -88,7 +88,8 @@ class EventSerializer(serializers.ModelSerializer):
 class EventCreateSerializer(serializers.ModelSerializer):
     """
     Submission serializer for organizers.
-    Enforces initial status=pending and stores raw_content as-is.
+    Enforces submitter authorization (verified officer, admin, or owner).
+    Direct publish (status=approved) for owner and admins; status=pending for officers.
     """
     raw_content = serializers.JSONField(required=False, default=dict)
     club = serializers.PrimaryKeyRelatedField(queryset=Club.objects.all(), required=False, allow_null=True)
@@ -113,21 +114,60 @@ class EventCreateSerializer(serializers.ModelSerializer):
             'recurrence_pattern',
             'submitted_at',
             'status',
+            'approved_at',
+            'approved_by',
         ]
-        read_only_fields = ['id', 'submitted_at', 'status']
+        read_only_fields = ['id', 'submitted_at', 'status', 'approved_at', 'approved_by']
 
     def validate(self, attrs):
+        from rest_framework.exceptions import PermissionDenied
+        from .permissions import get_telegram_admin_from_request
+
+        request = self.context.get('request')
+        submitter_id_raw = request.headers.get('X-Telegram-User-Id') if request else None
+
+        if not submitter_id_raw:
+            raise PermissionDenied("Submitter Telegram ID is required via 'X-Telegram-User-Id' header.")
+
+        try:
+            submitter_id = int(str(submitter_id_raw).strip())
+        except (ValueError, TypeError):
+            raise PermissionDenied("Invalid 'X-Telegram-User-Id' header value.")
+
+        admin_obj = get_telegram_admin_from_request(request) if request else None
+        is_admin_or_owner = bool(admin_obj)
+
         club = attrs.get('club')
         custom_club = attrs.get('custom_club')
+
         if not club and not custom_club:
-            # Default to custom club if neither provided
             attrs['custom_club'] = 'Independent / Student Initiative'
+            custom_club = attrs['custom_club']
+
+        # If not admin or owner, verify that the submitter is an authorized officer for the specified club
+        if not is_admin_or_owner:
+            if not club:
+                raise PermissionDenied("Only admins or owner can submit events for custom unlisted clubs.")
+            if not club.is_officer(submitter_id):
+                raise PermissionDenied(f"Telegram ID {submitter_id} is not an authorized verified officer for '{club.name}'.")
+
         return attrs
 
     def create(self, validated_data):
-        # Force initial status to pending for submissions
-        validated_data['status'] = EventStatus.PENDING
+        from .permissions import get_telegram_admin_from_request
+        request = self.context.get('request')
+        admin_obj = get_telegram_admin_from_request(request) if request else None
+
+        if admin_obj:
+            # Direct publish for owner and admins
+            validated_data['status'] = EventStatus.APPROVED
+            validated_data['approved_at'] = timezone.now()
+            validated_data['approved_by'] = admin_obj.name or str(admin_obj.telegram_id)
+        else:
+            validated_data['status'] = EventStatus.PENDING
+
         return super().create(validated_data)
+
 
 
 class EventStatusUpdateSerializer(serializers.ModelSerializer):

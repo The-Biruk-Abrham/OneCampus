@@ -209,7 +209,11 @@ class SeedDataCommandTest(TestCase):
 
 class EventsAPITestCase(APITestCase):
     def setUp(self):
-        self.now = timezone.now()
+        from django.conf import settings
+        self.internal_secret = getattr(settings, 'INTERNAL_API_SECRET', 'hub-secret-dev-token-987412365')
+        self.client.credentials(HTTP_X_HUB_INTERNAL_SECRET=self.internal_secret)
+
+        self.now = timezone.localtime(timezone.now())
         self.admin_telegram_id = 999000111
         self.admin = TelegramAdmin.objects.create(
             telegram_id=self.admin_telegram_id,
@@ -220,10 +224,10 @@ class EventsAPITestCase(APITestCase):
         self.category_sports = Category.objects.create(name="Sports", description="Sports events")
         self.category_academic = Category.objects.create(name="Academic", description="Lectures")
         self.club = Club.objects.create(
-            name="ASTU Developer Club",
+            name="AASTU Developer Club",
             category_type="Technology",
             verified_officers=[123456],
-            contact_info="devs@astu.edu.et"
+            contact_info="devs@aastu.edu.et"
         )
 
         # Approved Event Today
@@ -259,6 +263,20 @@ class EventsAPITestCase(APITestCase):
             raw_content={"media_type": "document", "file_ids": ["doc999"], "caption": "Pending approval"}
         )
 
+    def test_missing_or_invalid_internal_api_secret_denied(self):
+        # Request without header
+        self.client.credentials()
+        response = self.client.get('/api/events/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Request with wrong secret
+        self.client.credentials(HTTP_X_HUB_INTERNAL_SECRET="wrong-secret")
+        response = self.client.get('/api/events/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Restore valid secret
+        self.client.credentials(HTTP_X_HUB_INTERNAL_SECRET=self.internal_secret)
+
     def test_get_events_today_range(self):
         response = self.client.get('/api/events/?range=today')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -267,6 +285,33 @@ class EventsAPITestCase(APITestCase):
         self.assertNotIn("AI Workshop This Week", titles)
         # Pending events should not appear in public query
         self.assertNotIn("Pending Guest Lecture", titles)
+
+    def test_timezone_midnight_boundary_today_and_tomorrow(self):
+        local_today_start = self.now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # 23:30 local time today
+        event_late_today = Event.objects.create(
+            club=self.club,
+            category=self.category_sports,
+            title="Late Night Hackathon Session",
+            start_datetime=local_today_start.replace(hour=23, minute=30),
+            location="ICT Lab",
+            status=EventStatus.APPROVED
+        )
+        # 00:30 local time tomorrow
+        event_early_tomorrow = Event.objects.create(
+            club=self.club,
+            category=self.category_sports,
+            title="Early Morning Dawn Run",
+            start_datetime=(local_today_start + timedelta(days=1)).replace(hour=0, minute=30),
+            location="Track Field",
+            status=EventStatus.APPROVED
+        )
+
+        response = self.client.get('/api/events/?range=today')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        titles = [e['title'] for e in response.data]
+        self.assertIn("Late Night Hackathon Session", titles)
+        self.assertNotIn("Early Morning Dawn Run", titles)
 
     def test_get_events_week_range(self):
         response = self.client.get('/api/events/?range=week')
@@ -283,7 +328,7 @@ class EventsAPITestCase(APITestCase):
         self.assertIn("Football Match Today", titles)
         self.assertNotIn("AI Workshop This Week", titles)
 
-    def test_post_event_creates_pending_status(self):
+    def test_post_event_by_officer_creates_pending_status(self):
         payload = {
             "title": "Freshman Orientation",
             "club": self.club.id,
@@ -298,14 +343,60 @@ class EventsAPITestCase(APITestCase):
             # Submitter tries to set status to approved
             "status": "approved"
         }
-        response = self.client.post('/api/events/', data=payload, format='json')
+        # Submitter is verified officer 123456
+        response = self.client.post(
+            '/api/events/',
+            data=payload,
+            format='json',
+            HTTP_X_TELEGRAM_USER_ID="123456"
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         created_id = response.data['id']
         created_event = Event.objects.get(id=created_id)
-        # Verify status is forced to PENDING
+        # Verify status is forced to PENDING for officer
         self.assertEqual(created_event.status, EventStatus.PENDING)
         self.assertEqual(created_event.title, "Freshman Orientation")
         self.assertEqual(created_event.raw_content["media_type"], "photo")
+
+    def test_post_event_by_admin_direct_publishes(self):
+        payload = {
+            "title": "Admin Direct Announcement",
+            "club": self.club.id,
+            "category": self.category_academic.id,
+            "start_datetime": (self.now + timedelta(days=2)).isoformat(),
+            "location": "Main Auditorium",
+            "raw_content": {"media_type": "text", "file_ids": [], "caption": "Official announcement."}
+        }
+        response = self.client.post(
+            '/api/events/',
+            data=payload,
+            format='json',
+            HTTP_X_TELEGRAM_USER_ID=str(self.admin_telegram_id)
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_id = response.data['id']
+        created_event = Event.objects.get(id=created_id)
+        # Verify status is APPROVED directly
+        self.assertEqual(created_event.status, EventStatus.APPROVED)
+        self.assertIsNotNone(created_event.approved_at)
+        self.assertEqual(created_event.approved_by, "API Superadmin")
+
+    def test_post_event_by_unauthorized_user_denied(self):
+        payload = {
+            "title": "Unauthorized Event",
+            "club": self.club.id,
+            "category": self.category_academic.id,
+            "start_datetime": (self.now + timedelta(days=2)).isoformat(),
+            "location": "Room 101",
+        }
+        # Unregistered telegram ID
+        response = self.client.post(
+            '/api/events/',
+            data=payload,
+            format='json',
+            HTTP_X_TELEGRAM_USER_ID="999888777"
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_patch_event_status_as_admin(self):
         url = f'/api/events/{self.event_pending.id}/status/'
@@ -369,7 +460,30 @@ class EventsAPITestCase(APITestCase):
         response = self.client.get('/api/clubs/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = [c['name'] for c in response.data]
-        self.assertIn("ASTU Developer Club", names)
+        self.assertIn("AASTU Developer Club", names)
+
+    def test_create_club_as_admin(self):
+        url = '/api/clubs/'
+        payload = {
+            "name": "AASTU Cybersecurity Club",
+            "category_type": "Technology",
+            "contact_info": "@aastusec",
+        }
+        response = self.client.post(
+            url,
+            data=payload,
+            format='json',
+            HTTP_X_TELEGRAM_USER_ID=str(self.admin_telegram_id),
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["name"], "AASTU Cybersecurity Club")
+        self.assertTrue(Club.objects.filter(name="AASTU Cybersecurity Club").exists())
+
+    def test_create_club_unauthorized(self):
+        url = '/api/clubs/'
+        payload = {"name": "Unauthorized Club"}
+        response = self.client.post(url, data=payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_add_officer_as_admin(self):
         url = f'/api/clubs/{self.club.id}/officers/'
@@ -413,3 +527,14 @@ class EventsAPITestCase(APITestCase):
         names = [c['name'] for c in response.data]
         self.assertIn("Sports", names)
         self.assertIn("Academic", names)
+
+    def test_admin_check_endpoint(self):
+        # Admin check with valid admin telegram ID
+        response = self.client.get('/api/admin-check/', HTTP_X_TELEGRAM_USER_ID=str(self.admin_telegram_id))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data.get('is_admin'))
+
+        # Admin check with non-admin telegram ID
+        response = self.client.get('/api/admin-check/', HTTP_X_TELEGRAM_USER_ID="111222333")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(response.data.get('is_admin'))

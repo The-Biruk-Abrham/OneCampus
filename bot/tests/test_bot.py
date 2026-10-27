@@ -53,9 +53,10 @@ class TestFormatters(unittest.TestCase):
         dt1 = parse_datetime("2026-09-05T14:00:00Z")
         dt2 = parse_datetime("2026-09-05T17:30:00Z")
         self.assertIsNotNone(dt1)
-        self.assertEqual(dt1.hour, 14)
+        # 14:00 UTC is 17:00 Addis Ababa time (UTC+3)
+        self.assertEqual(dt1.hour, 17)
         formatted = format_time_range(dt1, dt2)
-        self.assertEqual(formatted, "2:00 PM – 5:30 PM")
+        self.assertEqual(formatted, "5:00 PM – 8:30 PM")
 
     def test_format_event_card(self):
         card = format_event_card(self.sample_event, index=1)
@@ -74,7 +75,7 @@ class TestFormatters(unittest.TestCase):
         text, total_pages, total_count = format_today_events(events, page=1, page_size=2)
         self.assertEqual(total_count, 1)
         self.assertEqual(total_pages, 1)
-        self.assertIn("Today at ASTU", text)
+        self.assertIn("Today at AASTU", text)
         self.assertIn("Robotics & AI Expo 2026", text)
 
     def test_format_today_events_empty(self):
@@ -92,7 +93,7 @@ class TestFormatters(unittest.TestCase):
 
         events = [self.sample_event, event2]
         text = format_week_events(events)
-        self.assertIn("This Week at ASTU", text)
+        self.assertIn("This Week at AASTU", text)
         self.assertIn("Saturday, Sep 05", text)
         self.assertIn("Sunday, Sep 06", text)
         self.assertIn("Robotics & AI Expo 2026", text)
@@ -109,9 +110,31 @@ class TestFormatters(unittest.TestCase):
         self.assertIn("Career/Workshop Events", text)
         self.assertIn("Robotics & AI Expo 2026", text)
 
-    def test_format_channel_post(self):
-        post = format_channel_post(self.sample_event)
+    def test_format_channel_post_forwarded(self):
+        fwd_event = dict(self.sample_event)
+        fwd_event["raw_content"] = {
+            "media_type": "photo",
+            "is_forwarded": True,
+            "caption": "🤖 Don't miss our live drone flight showcase!",
+            "file_ids": ["sample_file_id_123"],
+        }
+        post = format_channel_post(fwd_event)
         self.assertEqual(post, "🤖 Don't miss our live drone flight showcase!")
+
+    def test_format_channel_post_manual(self):
+        manual_event = dict(self.sample_event)
+        manual_event["raw_content"] = {
+            "media_type": "text",
+            "is_forwarded": False,
+            "caption": "Please bring your student ID and laptop.",
+        }
+        post = format_channel_post(manual_event)
+        self.assertIn("NEW CAMPUS EVENT", post)
+        self.assertIn("Robotics & AI Expo 2026", post)
+        self.assertIn("ASTU Robotics Society", post)
+        self.assertIn("Career/Workshop", post)
+        self.assertIn("Auditorium Hall", post)
+        self.assertIn("Please bring your student ID and laptop.", post)
 
 
 class TestPagination(unittest.TestCase):
@@ -165,12 +188,29 @@ class TestPagination(unittest.TestCase):
         self.assertEqual(kb.inline_keyboard[0][0].callback_data, "btn:categories")
         self.assertEqual(kb.inline_keyboard[0][1].callback_data, "btn:main_menu")
 
-    def test_build_start_keyboard(self):
-        kb = build_start_keyboard()
+    def test_build_start_keyboard_standard_user(self):
+        kb = build_start_keyboard(is_owner=False, is_officer=False)
         self.assertIsNotNone(kb)
-        self.assertEqual(len(kb.inline_keyboard), 3)  # Today/Week, Categories, Submit
+        self.assertEqual(len(kb.inline_keyboard), 2)  # Today/Week, Categories (No Submit Button for non-reps)
+        self.assertEqual(kb.inline_keyboard[0][0].callback_data, "btn:today")
+        self.assertEqual(kb.inline_keyboard[1][0].callback_data, "btn:categories")
+
+    def test_build_start_keyboard_officer(self):
+        kb = build_start_keyboard(is_owner=False, is_officer=True)
+        self.assertIsNotNone(kb)
+        self.assertEqual(len(kb.inline_keyboard), 3)  # Today/Week, Categories, Submit Post
         self.assertEqual(kb.inline_keyboard[0][0].callback_data, "btn:today")
         self.assertEqual(kb.inline_keyboard[2][0].callback_data, "btn:submit")
+        self.assertIn("Submit Post", kb.inline_keyboard[2][0].text)
+
+    def test_build_start_keyboard_owner(self):
+        kb = build_start_keyboard(is_owner=True)
+        self.assertIsNotNone(kb)
+        self.assertEqual(len(kb.inline_keyboard), 5)  # Today/Week, Categories, Submit, Owner Admin Row, Register Club Row
+        self.assertEqual(kb.inline_keyboard[3][0].callback_data, "owner:add_admin")
+        self.assertEqual(kb.inline_keyboard[3][1].callback_data, "owner:remove_admin")
+        self.assertEqual(kb.inline_keyboard[4][0].callback_data, "owner:create_club")
+
 
 
 class TestBotApiClient(unittest.IsolatedAsyncioTestCase):
@@ -211,8 +251,9 @@ class TestBotApplicationBuilder(unittest.TestCase):
         dummy_token = "123456789:ABCDEF_mock_token_for_unit_tests_12345"
         app = build_bot_application(token=dummy_token)
         self.assertIsNotNone(app)
-        self.assertEqual(len(app.handlers[0]), 14)
+        self.assertTrue(len(app.handlers[0]) >= 15)
 
 
 if __name__ == '__main__':
     unittest.main()
+

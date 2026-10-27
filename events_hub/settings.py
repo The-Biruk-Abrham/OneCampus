@@ -72,7 +72,11 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'events.middleware.InternalApiSecretMiddleware',
 ]
+
+INTERNAL_API_SECRET = os.getenv('INTERNAL_API_SECRET', 'hub-secret-dev-token-987412365').strip()
+TELEGRAM_OWNER_ID = os.getenv('TELEGRAM_OWNER_ID', '').strip()
 
 ROOT_URLCONF = 'events_hub.urls'
 
@@ -153,11 +157,12 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Africa/Addis_Ababa'
 
 USE_I18N = True
 
 USE_TZ = True
+
 
 
 # Static files (CSS, JavaScript, Images)

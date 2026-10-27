@@ -1,22 +1,32 @@
 import logging
 import sys
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
-from .config import TELEGRAM_BOT_TOKEN, API_BASE_URL
+from .config import TELEGRAM_BOT_TOKEN, API_BASE_URL, is_owner
+from .pagination import build_start_keyboard
 from .handlers.start import start_command
 from .handlers.today import today_command
 from .handlers.week import week_command
 from .handlers.events import events_command
 from .handlers.callbacks import callback_router
-from .handlers.submit import get_submission_conversation_handler
+from .handlers.submit import get_submission_conversation_handler, get_user_verified_clubs
 from .handlers.admin import pending_events_command, check_config_command, get_admin_edit_conversation_handler
-from .handlers.officers import add_officer_command, remove_officer_command, list_officers_command
+from .handlers.officers import (
+    add_officer_command,
+    remove_officer_command,
+    list_officers_command,
+    add_club_command,
+    get_officer_management_conversation_handler,
+)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -25,6 +35,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 import telegram.error
 from telegram.request import HTTPXRequest
+
+
+import warnings
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", message=r".*per_message=False.*", category=PTBUserWarning)
+
+
+async def idle_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles forwarded messages or unsolicited media sent when no conversation session is active.
+    Informs the user to tap 'Submit Post' or use the main menu.
+    """
+    if not update.effective_message:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+    user_is_owner = is_owner(user_id)
+    user_is_officer = False
+    try:
+        verified_clubs = await get_user_verified_clubs(user_id)
+        user_is_officer = bool(verified_clubs) or user_is_owner
+    except Exception:
+        user_is_officer = user_is_owner
+
+    if user_is_officer:
+        msg = (
+            "ℹ️ *You forwarded a message!*\n\n"
+            "To submit an event, type `/submit` or click *📝 Submit Post* below."
+        )
+    else:
+        msg = (
+            "ℹ️ *Welcome to Addis Ababa Science and Technology University (AASTU) Events Hub!*\n\n"
+            "Use `/events` or the menu below to browse upcoming campus events and activities."
+        )
+
+    keyboard = build_start_keyboard(is_owner=user_is_owner, is_officer=user_is_officer)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -77,9 +125,10 @@ def build_bot_application(token: str = None) -> Application:
         .build()
     )
 
-    # Submission and Admin Edit Conversation Handlers (High Priority)
-    application.add_handler(get_submission_conversation_handler())
+    # Submission, Admin Edit, and Officer Management Conversation Handlers (High Priority)
+    application.add_handler(get_officer_management_conversation_handler())
     application.add_handler(get_admin_edit_conversation_handler())
+    application.add_handler(get_submission_conversation_handler())
 
     # Public Viewing Command Handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -89,15 +138,34 @@ def build_bot_application(token: str = None) -> Application:
     application.add_handler(CommandHandler("events", events_command))
     application.add_handler(CommandHandler("cancel", start_command))
 
-    # Admin Management Command Handlers
+    # Admin / Owner Management Command Handlers
     application.add_handler(CommandHandler("pending", pending_events_command))
     application.add_handler(CommandHandler("check_config", check_config_command))
+    application.add_handler(CommandHandler("add_club", add_club_command))
     application.add_handler(CommandHandler("add_officer", add_officer_command))
     application.add_handler(CommandHandler("remove_officer", remove_officer_command))
+    application.add_handler(CommandHandler("add_club_admin", add_officer_command))
+    application.add_handler(CommandHandler("remove_club_admin", remove_officer_command))
     application.add_handler(CommandHandler("officers", list_officers_command))
 
     # Callback Query Handler (Pagination, Navigation, and Admin Actions)
     application.add_handler(CallbackQueryHandler(callback_router))
+
+    # Fallback message handler for idle forwards or unsolicited media in private chats
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & (
+                filters.FORWARDED
+                | filters.PHOTO
+                | filters.VIDEO
+                | filters.ANIMATION
+                | filters.Document.ALL
+                | filters.AUDIO
+                | filters.VOICE
+            ),
+            idle_message_handler,
+        )
+    )
 
     # Global Error Handler
     application.add_error_handler(error_handler)
